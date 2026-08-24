@@ -1,9 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Greg Gorman
+# SPDX-License-Identifier: MIT
+
+"""Interactive 2.4 GHz Wi-Fi survey tool for the M5Stack StickS3.
+
+The UiFlow2 ``wlan.scan()`` call is synchronous and normally freezes both the
+display and button polling for several seconds.  This application keeps the
+interface responsive by assigning all radio scans to one worker thread.  The
+main thread owns the display, buttons, speaker, and application state; the two
+threads exchange one pending request and one completed result under a lock.
+
+Three user modes are provided:
+
+* Pick Wi-Fi: scan and select a visible SSID.
+* Meter: continuously show the strongest AP broadcasting the selected SSID.
+* Walk Graph: capture deliberate, button-triggered RSSI samples around a room.
+
+The code targets UiFlow2 MicroPython rather than desktop CPython.  It relies on
+M5Stack-specific display, button, and speaker APIs.
+"""
+
 import M5
 from M5 import *
 import network
 import time
 import _thread
 
+
+# ---------------------------------------------------------------------------
+# Display palette and device initialization
+# ---------------------------------------------------------------------------
 
 BG = 0x101820
 WHITE = 0xFFFFFF
@@ -19,6 +44,7 @@ display.fillScreen(BG)
 wlan = network.WLAN(network.STA_IF)
 wlan.active(True)
 
+# Application state is owned and mutated by the main thread only.
 mode = 0
 target = ""
 visible_networks = []
@@ -27,6 +53,9 @@ graph_points = []
 graph_generation = 0
 last_meter_request = 0
 
+# Worker handoff state.  A request is ``(kind, ssid, graph_generation)``.
+# A result is ``(request, scan_rows, error_message)``.  Keeping a single radio
+# owner prevents overlapping calls into the MicroPython network stack.
 scan_lock = _thread.allocate_lock()
 scan_request = None
 scan_result = None
@@ -34,6 +63,8 @@ scan_busy = False
 
 
 def safe_ssid(raw):
+    """Decode an SSID and replace glyphs unsupported by the small display font."""
+
     try:
         value = raw.decode()
     except Exception:
@@ -48,20 +79,28 @@ def safe_ssid(raw):
 
 
 def color_for(rssi):
+    """Return the display color for an RSSI value measured in dBm."""
+
     return GREEN if rssi >= -55 else (YELLOW if rssi >= -70 else RED)
 
 
 def text(value, x, y, color=WHITE, large=False):
+    """Draw a short text label using one of the two application font sizes."""
+
     display.setFont(display.FONTS.DejaVu18 if large else display.FONTS.DejaVu12)
     display.setTextColor(color, BG)
     display.drawString(str(value), x, y)
 
 
 def footer(action):
+    """Draw the standard front-button and side-button hint."""
+
     text("A:%s  B:mode" % action, 3, 222, MUTED)
 
 
 def beep(frequency=5000, duration=100):
+    """Play a non-critical UI tone; keep running if audio is unavailable."""
+
     try:
         Speaker.tone(frequency, duration)
     except Exception:
@@ -69,6 +108,12 @@ def beep(frequency=5000, duration=100):
 
 
 def request_scan(kind, name="", generation=0):
+    """Queue a scan, replacing any older request that has not started yet.
+
+    Replacing a pending request is intentional: the newest user action is more
+    useful than an obsolete automatic meter refresh.
+    """
+
     global scan_request
     scan_lock.acquire()
     scan_request = (kind, name, generation)
@@ -76,6 +121,8 @@ def request_scan(kind, name="", generation=0):
 
 
 def worker_loop():
+    """Own the Wi-Fi radio and publish completed scans to the main thread."""
+
     global scan_request, scan_result, scan_busy
     while True:
         request = None
@@ -103,6 +150,8 @@ def worker_loop():
 
 
 def take_result():
+    """Atomically consume the worker's most recently completed result."""
+
     global scan_result
     scan_lock.acquire()
     result = scan_result
@@ -112,6 +161,8 @@ def take_result():
 
 
 def radio_idle():
+    """Return True when no scan is active or waiting to start."""
+
     scan_lock.acquire()
     idle = not scan_busy and scan_request is None
     scan_lock.release()
@@ -119,6 +170,12 @@ def radio_idle():
 
 
 def grouped(rows):
+    """Group raw AP rows by SSID and retain each network's strongest radio.
+
+    A grouped row has the shape ``(best_rssi, channel, ap_count, ssid)``.
+    Hidden SSIDs are counted separately so they do not crowd the pick screen.
+    """
+
     networks = {}
     hidden = 0
     for item in rows:
@@ -141,6 +198,8 @@ def grouped(rows):
 
 
 def target_result(rows, name):
+    """Return strongest RSSI, channel, and AP count for one selected SSID."""
+
     matches = [item for item in rows if safe_ssid(item[0]) == name]
     if not matches:
         return None, None, 0
@@ -148,7 +207,14 @@ def target_result(rows, name):
     return best[3], best[2], len(matches)
 
 
+# ---------------------------------------------------------------------------
+# Pick Wi-Fi mode
+# ---------------------------------------------------------------------------
+
+
 def draw_list():
+    """Render the selectable, scrolling list of grouped network names."""
+
     display.fillScreen(BG)
     text("PICK WIFI", 4, 4, WHITE, True)
     text("%d found" % len(visible_networks), 4, 26, MUTED)
@@ -165,6 +231,8 @@ def draw_list():
 
 
 def start_list_scan():
+    """Clear the previous list, show progress, and queue a fresh discovery."""
+
     global visible_networks, selected_index
     visible_networks = []
     selected_index = 0
@@ -172,7 +240,14 @@ def start_list_scan():
     request_scan("list")
 
 
+# ---------------------------------------------------------------------------
+# Live Meter mode
+# ---------------------------------------------------------------------------
+
+
 def draw_meter_shell():
+    """Draw static meter elements once so later scans do not blank the screen."""
+
     display.fillScreen(BG)
     text("METER", 4, 4, WHITE, True)
     text(target[:16], 4, 29, BLUE)
@@ -182,6 +257,8 @@ def draw_meter_shell():
 
 
 def update_meter(rows):
+    """Update only dynamic meter regions from a completed background scan."""
+
     rssi, channel, count = target_result(rows, target)
     display.fillRect(0, 54, 135, 54, BG)
     display.fillRect(9, 120, 117, 23, BG)
@@ -195,18 +272,28 @@ def update_meter(rows):
     display.setTextColor(color, BG)
     display.drawString(str(rssi), 18, 58)
     text("dBm", 88, 82, color)
+    # Map the useful -90..-30 dBm range onto a simple 0..100 bar.
     quality = max(0, min(100, (rssi + 90) * 100 // 60))
     display.fillRect(11, 122, quality * 113 // 100, 19, color)
     text("Channel %d" % channel, 8, 157, WHITE)
     text("Mesh radios %d" % count, 8, 180, WHITE)
 
 
+# ---------------------------------------------------------------------------
+# Walk Graph mode
+# ---------------------------------------------------------------------------
+
+
 def graph_y(rssi):
+    """Map -30..-90 dBm onto the graph's top-to-bottom pixel range."""
+
     clipped = max(-90, min(-30, rssi))
     return 50 + ((-30 - clipped) * 140 // 60)
 
 
 def draw_graph(message=None, message_color=MUTED):
+    """Redraw the graph, its latest 12 visible points, and optional status."""
+
     display.fillScreen(BG)
     text("WALK GRAPH", 4, 4, WHITE, True)
     text(target[:13] + "  %d pts" % len(graph_points), 4, 27, BLUE)
@@ -233,13 +320,21 @@ def draw_graph(message=None, message_color=MUTED):
     footer("point")
 
 
+# ---------------------------------------------------------------------------
+# State transitions and worker-result processing
+# ---------------------------------------------------------------------------
+
+
 def change_mode():
+    """Advance List -> Meter -> Graph and initialize the destination mode."""
+
     global mode, target, graph_points, graph_generation, last_meter_request
     if mode == 0 and visible_networks:
         chosen = visible_networks[selected_index][3]
         if chosen != target:
             target = chosen
             graph_points = []
+            # Invalidate an in-flight point belonging to the old SSID.
             graph_generation += 1
     mode = (mode + 1) % 3
     beep(4200, 60)
@@ -254,6 +349,8 @@ def change_mode():
 
 
 def process_result(result):
+    """Apply a completed scan only if it still belongs to the active state."""
+
     global visible_networks, selected_index, last_meter_request
     if result is None:
         return
@@ -275,6 +372,8 @@ def process_result(result):
     elif kind == "meter" and mode == 1 and name == target:
         update_meter(rows)
         last_meter_request = time.ticks_ms()
+    # The generation token prevents a scan started before graph-clear or an
+    # SSID change from quietly adding a stale point afterward.
     elif kind == "graph" and mode == 2 and name == target and generation == graph_generation:
         rssi, channel, count = target_result(rows, target)
         if rssi is None:
@@ -288,10 +387,16 @@ def process_result(result):
             beep(5000, 120)
 
 
+# ---------------------------------------------------------------------------
+# Startup and responsive main loop
+# ---------------------------------------------------------------------------
+
+
 _thread.start_new_thread(worker_loop, ())
 start_list_scan()
 
 while True:
+    # M5.update() must run frequently for click/hold events to be recognized.
     M5.update()
     process_result(take_result())
 
@@ -314,6 +419,8 @@ while True:
             draw_graph("SAMPLING #%d..." % (len(graph_points) + 1), YELLOW)
             request_scan("graph", target, graph_generation)
 
+    # Meter refreshes are opportunistic: never queue one over a user-requested
+    # graph sample or another scan already using the radio.
     if mode == 1 and radio_idle() and time.ticks_diff(time.ticks_ms(), last_meter_request) >= 1000:
         request_scan("meter", target)
         last_meter_request = time.ticks_ms()
