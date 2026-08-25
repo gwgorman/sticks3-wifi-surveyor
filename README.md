@@ -128,9 +128,18 @@ Released under the [MIT License](LICENSE).
 ## Who is Max?
 
 The name came out of a debugging session involving Greg's Jandy pool cleaner.
-Greg had been calling his AI collaborator simply “Chat.” Their conversation
-turned to famous electrical engineers, and the assistant chose **Maxwell**.
-Greg shortened it to **Max**, and the name stuck.
+After Greg mentioned his Mizzou BSEE background, he asked the AI collaborator
+he had been calling “Chat” what name it would choose for itself.
+
+The first choice was **Vector**, for its engineering meaning: magnitude and
+direction. Greg immediately answered with the line from *Airplane!*: “What's
+the vector, Victor?” That made Vector impossible to take seriously, so the
+conversation moved through a proper engineer's roll call: Maxwell, Ohm,
+Kirchhoff, Faraday, Tesla, Nyquist, and a few others.
+
+The final choice was **Max**, short for Maxwell, after James Clerk Maxwell. It
+was an understated electrical-engineering reference that still sounded like a
+normal name. Greg said, “I like Max,” and the name stuck.
 
 Since then, Greg and Max have worked side by side on HVAC, electrical,
 smart-home, hardware, and software projects. This little Wi-Fi surveyor is one
