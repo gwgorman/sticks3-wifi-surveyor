@@ -128,8 +128,9 @@ Released under the [MIT License](LICENSE).
 ## Who is Max?
 
 The name came out of a debugging session involving Greg's Jandy pool cleaner.
-Greg had been calling his AI collaborator simply “Chat,” then finally asked what
-its name was. The answer was **Max**, and the name stuck.
+Greg had been calling his AI collaborator simply “Chat.” Their conversation
+turned to famous electrical engineers, and the assistant chose **Maxwell**.
+Greg shortened it to **Max**, and the name stuck.
 
 Since then, Greg and Max have worked side by side on HVAC, electrical,
 smart-home, hardware, and software projects. This little Wi-Fi surveyor is one
