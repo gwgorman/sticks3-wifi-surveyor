@@ -3,6 +3,8 @@
 A pocket-sized 2.4 GHz Wi-Fi survey tool for the M5Stack StickS3, built with
 UiFlow2 MicroPython.
 
+Created by **Greg Gorman with Max (OpenAI Codex)**.
+
 It scans nearby networks, follows the strongest access point broadcasting a
 selected SSID, and records a walk-through signal graph one deliberate sample at
 a time.

@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Greg Gorman
 # SPDX-License-Identifier: MIT
+# Project: Greg Gorman with Max (OpenAI Codex)
 
 """Interactive 2.4 GHz Wi-Fi survey tool for the M5Stack StickS3.
 
