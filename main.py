@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Project: Greg Gorman with Max (OpenAI Codex)
 
-"""Interactive 2.4 GHz Wi-Fi survey tool for the M5Stack StickS3.
+"""Interactive Wi-Fi and BLE survey tool for the M5Stack StickS3.
 
 The UiFlow2 ``wlan.scan()`` call is synchronous and normally freezes both the
 display and button polling for several seconds.  This application keeps the
@@ -16,12 +16,18 @@ Three user modes are provided:
 * Meter: continuously show the strongest AP broadcasting the selected SSID.
 * Walk Graph: capture deliberate, button-triggered RSSI samples around a room.
 
+The RF SCOUT home menu also opens a BLE advertisement scanner and a live
+proximity meter. Unnamed advertisers are labeled by manufacturer, service, or a
+short address fingerprint. BLE scan windows use moderate duty cycles to balance
+responsiveness and battery life.
+
 The code targets UiFlow2 MicroPython rather than desktop CPython.  It relies on
 M5Stack-specific display, button, and speaker APIs.
 """
 
 import M5
 from M5 import *
+import bluetooth
 import network
 import time
 import _thread
@@ -47,7 +53,9 @@ wlan.active(True)
 
 # Application state is owned and mutated by the main thread only.
 mode = 0
-target = ""
+app = "home"
+home_index = 0
+target = "Pickett"
 visible_networks = []
 selected_index = 0
 graph_points = []
@@ -61,6 +69,43 @@ scan_lock = _thread.allocate_lock()
 scan_request = None
 scan_result = None
 scan_busy = False
+
+# BLE state is independent of the Wi-Fi worker. BLE scans are asynchronous and
+# deliver advertisement events through an IRQ callback.
+ble = bluetooth.BLE()
+ble_devices = {}
+ble_visible = []
+ble_selected_index = 0
+ble_tracking = None
+ble_scan_busy = False
+ble_scan_started = 0
+ble_results_ready = False
+ble_list_frozen = False
+
+IRQ_SCAN_RESULT = 5
+IRQ_SCAN_DONE = 6
+ADV_NAME = 0x09
+ADV_SHORT_NAME = 0x08
+ADV_SERVICE_16_INCOMPLETE = 0x02
+ADV_SERVICE_16_COMPLETE = 0x03
+ADV_MANUFACTURER = 0xFF
+
+BLE_COMPANIES = {
+    0x0006: "Microsoft",
+    0x004C: "Apple",
+    0x0059: "Nordic",
+    0x0075: "Samsung",
+    0x00E0: "Google",
+}
+
+# Scan for roughly one second at a moderate duty cycle, then rest briefly.
+# Tracking gets a wider receive window than discovery for steadier RSSI without
+# leaving the BLE receiver at full duty continuously.
+BLE_SCAN_INTERVAL_US = 100000
+BLE_LIST_WINDOW_US = 30000
+BLE_METER_WINDOW_US = 50000
+BLE_SCAN_DURATION_MS = 900
+BLE_SCAN_REST_MS = 100
 
 
 def safe_ssid(raw):
@@ -322,6 +367,220 @@ def draw_graph(message=None, message_color=MUTED):
 
 
 # ---------------------------------------------------------------------------
+# Tool home menu
+# ---------------------------------------------------------------------------
+
+
+def draw_home():
+    """Render the top-level radio-tool selector."""
+
+    display.fillScreen(BG)
+    text("RF SCOUT", 18, 12, WHITE, True)
+    text("Choose a tool", 22, 42, MUTED)
+    choices = ("WiFi", "BLE")
+    for index, label in enumerate(choices):
+        selected = index == home_index
+        color = BLUE if selected else WHITE
+        marker = ">" if selected else " "
+        text("%s %s" % (marker, label), 27, 82 + index * 45, color, True)
+    text("A:move B:open", 18, 222, MUTED)
+
+
+# ---------------------------------------------------------------------------
+# BLE scanner and meter
+# ---------------------------------------------------------------------------
+
+
+def ble_safe_text(raw):
+    try:
+        value = raw.decode()
+    except Exception:
+        return "Unknown"
+    return "".join(c if 32 <= ord(c) <= 126 else "?" for c in value) or "Unknown"
+
+
+def ble_identity(payload):
+    name = None
+    company = None
+    service = None
+    index = 0
+    while index + 1 < len(payload):
+        size = payload[index]
+        if size == 0:
+            break
+        end = index + size + 1
+        if end > len(payload):
+            break
+        field_type = payload[index + 1]
+        if field_type in (ADV_NAME, ADV_SHORT_NAME):
+            name = ble_safe_text(payload[index + 2:end])
+        elif field_type == ADV_MANUFACTURER and size >= 3:
+            company = payload[index + 2] | (payload[index + 3] << 8)
+        elif field_type in (ADV_SERVICE_16_INCOMPLETE, ADV_SERVICE_16_COMPLETE) and size >= 3:
+            service = payload[index + 2] | (payload[index + 3] << 8)
+        index = end
+    return name, company, service
+
+
+def ble_address_text(address):
+    return ":".join("%02X" % value for value in address)
+
+
+def ble_label(name, company, service, address):
+    if name and name != "Unknown":
+        return name
+    if company is not None:
+        return BLE_COMPANIES.get(company, "MFG %04X" % company)
+    if service is not None:
+        return "SVC %04X" % service
+    return "ID " + "".join("%02X" % value for value in address[-3:])
+
+
+def ble_irq(event, data):
+    global ble_scan_busy, ble_results_ready
+    if event == IRQ_SCAN_RESULT:
+        address_type, address, adv_type, rssi, payload = data
+        key = bytes(address)
+        name, company, service = ble_identity(payload)
+        previous = ble_devices.get(key)
+        if previous is not None:
+            if not name or name == "Unknown":
+                name = previous[1]
+            if company is None:
+                company = previous[4]
+            if service is None:
+                service = previous[5]
+        ble_devices[key] = (
+            rssi, name, address_type, time.ticks_ms(), company, service
+        )
+    elif event == IRQ_SCAN_DONE:
+        ble_scan_busy = False
+        ble_results_ready = True
+
+
+def rebuild_ble_visible():
+    global ble_visible, ble_selected_index
+    now = time.ticks_ms()
+    expired = [key for key, item in ble_devices.items()
+               if time.ticks_diff(now, item[3]) > 12000]
+    for key in expired:
+        del ble_devices[key]
+    ble_visible = sorted(
+        [(item[0], ble_label(item[1], item[4], item[5], key), key,
+          item[2], item[3]) for key, item in ble_devices.items()],
+        reverse=True,
+    )
+    if ble_visible:
+        ble_selected_index = min(ble_selected_index, len(ble_visible) - 1)
+    else:
+        ble_selected_index = 0
+
+
+def draw_ble_list():
+    display.fillScreen(BG)
+    text("BLE SCAN", 4, 4, WHITE, True)
+    status = " FROZEN" if ble_list_frozen else " devices"
+    text("%d%s" % (len(ble_visible), status), 4, 27, MUTED)
+    if not ble_visible:
+        text("Listening...", 5, 69, YELLOW, True)
+    start = ble_selected_index - 6 if ble_selected_index >= 7 else 0
+    for row, item_index in enumerate(
+            range(start, min(start + 7, len(ble_visible)))):
+        rssi, label, address, address_type, seen = ble_visible[item_index]
+        marker = ">" if item_index == ble_selected_index else " "
+        color = WHITE if marker == ">" else color_for(rssi)
+        text("%s%3d %s" % (marker, rssi, label[:10]),
+             1, 48 + row * 24, color)
+    text("A:next B:track", 3, 222, MUTED)
+
+
+def draw_ble_meter():
+    display.fillScreen(BG)
+    text("BLE METER", 4, 4, WHITE, True)
+    if ble_tracking is None:
+        return
+    label, address = ble_tracking
+    text(label[:16], 4, 29, BLUE)
+    text(ble_address_text(address), 4, 48, MUTED)
+    display.drawRect(8, 139, 119, 25, MUTED)
+    text("Waiting...", 7, 89, YELLOW, True)
+    text("B:back hold:home", 3, 222, MUTED)
+
+
+def update_ble_meter():
+    if ble_tracking is None:
+        return
+    label, address = ble_tracking
+    item = ble_devices.get(address)
+    display.fillRect(0, 75, 135, 121, BG)
+    display.drawRect(8, 139, 119, 25, MUTED)
+    if item is None or time.ticks_diff(time.ticks_ms(), item[3]) > 5000:
+        text("NOT SEEN", 7, 92, RED, True)
+        return
+    rssi = item[0]
+    color = color_for(rssi)
+    display.setFont(display.FONTS.DejaVu40)
+    display.setTextColor(color, BG)
+    display.drawString(str(rssi), 18, 78)
+    text("dBm", 88, 102, color)
+    quality = max(0, min(100, (rssi + 90) * 100 // 60))
+    display.fillRect(11, 142, quality * 113 // 100, 19, color)
+    strength = "STRONG" if rssi >= -55 else ("FAIR" if rssi >= -70 else "WEAK")
+    text(strength, 42, 174, color, True)
+
+
+def start_ble_scan(clear=False):
+    global ble_scan_busy, ble_scan_started, ble_results_ready
+    if ble_scan_busy:
+        return
+    if clear:
+        ble_devices.clear()
+    ble_results_ready = False
+    ble_scan_busy = True
+    ble_scan_started = time.ticks_ms()
+    window = (BLE_METER_WINDOW_US if app == "ble_meter"
+              else BLE_LIST_WINDOW_US)
+    ble.gap_scan(
+        BLE_SCAN_DURATION_MS,
+        BLE_SCAN_INTERVAL_US,
+        window,
+        True,
+    )
+
+
+def enter_tool():
+    global app, mode, ble_list_frozen, ble_selected_index
+    if home_index == 0:
+        app = "wifi"
+        mode = 0
+        start_list_scan()
+    else:
+        app = "ble_list"
+        ble_list_frozen = False
+        ble_selected_index = 0
+        ble.active(True)
+        ble.irq(ble_irq)
+        draw_ble_list()
+        start_ble_scan(True)
+
+
+def return_home():
+    global app, mode, ble_scan_busy, ble_results_ready, ble_tracking
+    if app.startswith("ble"):
+        try:
+            ble.gap_scan(None)
+        except Exception:
+            pass
+        ble_scan_busy = False
+        ble_results_ready = False
+        ble_tracking = None
+        ble.active(False)
+    app = "home"
+    mode = 0
+    draw_home()
+
+
+# ---------------------------------------------------------------------------
 # State transitions and worker-result processing
 # ---------------------------------------------------------------------------
 
@@ -353,7 +612,7 @@ def process_result(result):
     """Apply a completed scan only if it still belongs to the active state."""
 
     global visible_networks, selected_index, last_meter_request
-    if result is None:
+    if result is None or app != "wifi":
         return
     request, rows, error = result
     kind, name, generation = request
@@ -394,36 +653,82 @@ def process_result(result):
 
 
 _thread.start_new_thread(worker_loop, ())
-start_list_scan()
+draw_home()
 
 while True:
     # M5.update() must run frequently for click/hold events to be recognized.
     M5.update()
-    process_result(take_result())
+    completed_wifi_scan = take_result()
+    if app == "wifi":
+        process_result(completed_wifi_scan)
 
-    if BtnB.wasClicked():
-        change_mode()
-    elif mode == 2 and BtnA.wasHold():
-        graph_points = []
-        graph_generation += 1
-        draw_graph("GRAPH CLEARED", YELLOW)
-        beep(2500, 100)
-    elif BtnA.wasClicked():
-        if mode == 0:
-            if visible_networks:
-                selected_index = (selected_index + 1) % len(visible_networks)
-                draw_list()
-        elif mode == 1:
-            request_scan("meter", target)
-            last_meter_request = time.ticks_ms()
-        else:
-            draw_graph("SAMPLING #%d..." % (len(graph_points) + 1), YELLOW)
-            request_scan("graph", target, graph_generation)
+    if app != "home" and BtnB.wasHold():
+        return_home()
+    elif app == "home":
+        if BtnA.wasClicked():
+            home_index = (home_index + 1) % 2
+            draw_home()
+        elif BtnB.wasClicked():
+            enter_tool()
+    elif app == "wifi":
+        if BtnB.wasClicked():
+            change_mode()
+        elif mode == 2 and BtnA.wasHold():
+            graph_points = []
+            graph_generation += 1
+            draw_graph("GRAPH CLEARED", YELLOW)
+            beep(2500, 100)
+        elif BtnA.wasClicked():
+            if mode == 0:
+                if visible_networks:
+                    selected_index = (selected_index + 1) % len(visible_networks)
+                    draw_list()
+            elif mode == 1:
+                request_scan("meter", target)
+                last_meter_request = time.ticks_ms()
+            else:
+                draw_graph("SAMPLING #%d..." % (len(graph_points) + 1), YELLOW)
+                request_scan("graph", target, graph_generation)
+    elif app == "ble_list":
+        if BtnB.wasClicked() and ble_visible:
+            item = ble_visible[ble_selected_index]
+            ble_tracking = (item[1], item[2])
+            app = "ble_meter"
+            draw_ble_meter()
+        elif BtnA.wasHold():
+            ble_list_frozen = False
+            ble_selected_index = 0
+            draw_ble_list()
+        elif BtnA.wasClicked() and ble_visible:
+            ble_list_frozen = True
+            ble_selected_index = (ble_selected_index + 1) % len(ble_visible)
+            draw_ble_list()
+    elif app == "ble_meter" and BtnB.wasClicked():
+        ble_tracking = None
+        app = "ble_list"
+        ble_list_frozen = False
+        ble_selected_index = 0
+        draw_ble_list()
 
     # Meter refreshes are opportunistic: never queue one over a user-requested
     # graph sample or another scan already using the radio.
-    if mode == 1 and radio_idle() and time.ticks_diff(time.ticks_ms(), last_meter_request) >= 1000:
+    if app == "wifi" and mode == 1 and radio_idle() and time.ticks_diff(time.ticks_ms(), last_meter_request) >= 1000:
         request_scan("meter", target)
         last_meter_request = time.ticks_ms()
+
+    now = time.ticks_ms()
+    if app.startswith("ble"):
+        if ble_results_ready:
+            ble_results_ready = False
+            if app == "ble_list":
+                if not ble_list_frozen:
+                    rebuild_ble_visible()
+                    draw_ble_list()
+            else:
+                update_ble_meter()
+        if (not ble_scan_busy and
+                time.ticks_diff(now, ble_scan_started) >=
+                BLE_SCAN_DURATION_MS + BLE_SCAN_REST_MS):
+            start_ble_scan(False)
 
     time.sleep_ms(20)

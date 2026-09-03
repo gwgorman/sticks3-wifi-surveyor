@@ -1,13 +1,12 @@
 # StickS3 Wi-Fi Surveyor
 
-A pocket-sized 2.4 GHz Wi-Fi survey tool for the M5Stack StickS3, built with
-UiFlow2 MicroPython.
+A pocket-sized Wi-Fi and Bluetooth Low Energy survey tool for the M5Stack
+StickS3, built with UiFlow2 MicroPython.
 
 Created by **Greg Gorman with Max (OpenAI Codex)**.
 
-It scans nearby networks, follows the strongest access point broadcasting a
-selected SSID, and records a walk-through signal graph one deliberate sample at
-a time.
+It scans nearby Wi-Fi networks and BLE advertisements, tracks selected signals,
+and records a Wi-Fi walk-through graph one deliberate sample at a time.
 
 ## Features
 
@@ -20,6 +19,19 @@ a time.
 - Smart-punctuation cleanup for the StickS3 display font
 - Background Wi-Fi worker so buttons and display remain responsive during scans
 - No Wi-Fi credentials required
+- BLE advertisement scanner with name, manufacturer, service, or address labels
+- BLE proximity meter with stable, freeze-on-scroll device selection
+- Battery-conscious BLE scan windows rather than continuous full-duty listening
+
+## Home menu
+
+At startup, **RF SCOUT** offers two tools:
+
+- **WiFi**: the original network picker, live meter, and walk graph
+- **BLE**: advertisement discovery and live proximity tracking
+
+Use the front button to move and the side programmable button to open a tool.
+Hold the side button from any tool screen to return to the RF SCOUT menu.
 
 ## Tested hardware and firmware
 
@@ -50,6 +62,25 @@ The StickS3 radio scans **2.4 GHz only**. It cannot survey 5 GHz or 6 GHz.
 - A low beep means the selected network was not found
 - Hold the front blue button to clear all graph points
 - Side programmable button: return to the network list
+
+### BLE Scan
+
+- The list sorts by strongest signal while scanning
+- Front button: freeze the current order and move to the next device
+- Hold the front button: resume live sorting and return the cursor to the top
+- Side programmable button: track the selected device
+
+Devices that omit a readable name are labeled by recognized manufacturer,
+advertised service, or a shortened address fingerprint. Phones and many sensors
+use private addresses or deliberately omit names, so a label is not guaranteed
+to identify the exact product.
+
+### BLE Meter
+
+- Shows the selected device label, address, RSSI, signal bar, and strength band
+- Updates at approximately one-second intervals
+- Side programmable button: return to the live BLE list
+- Hold the side button: return to the RF SCOUT menu
 
 The bottom-left power/reset control is not a mode button. Single-click it to
 reset or power on, double-click it to power off, and avoid holding it because a
@@ -100,6 +131,13 @@ freeze the controls:
 - A small lock-protected handoff passes completed scans back to the main loop.
 - Results belonging to an old mode, network, or cleared graph are ignored.
 
+BLE scanning uses MicroPython's asynchronous advertisement callback. Results
+are collected during bounded scan windows and handed to the display only after
+each scan completes, preventing the list from changing while it is being drawn.
+Discovery listens at a lower duty cycle than tracking to conserve battery. Once
+the user starts scrolling, the displayed order remains frozen until live sorting
+is resumed.
+
 Meter mode keeps the previous reading visible until a new scan completes.
 Graph mode records the scan initiated by the button press rather than silently
 substituting an older cached value.
@@ -116,10 +154,10 @@ radio activity can all affect readings.
 
 ## Privacy and responsible use
 
-The application listens for ordinary Wi-Fi beacon broadcasts. It does not join
-networks, capture user traffic, or require passwords. Network names and access
-point identifiers can still be sensitive; obtain permission before surveying a
-property or sharing results.
+The application listens for ordinary Wi-Fi beacons and BLE advertisements. It
+does not join networks, connect to BLE devices, capture user traffic, or require
+passwords. Network names, BLE addresses, and access-point identifiers can still
+be sensitive; obtain permission before surveying a property or sharing results.
 
 ## License
 
